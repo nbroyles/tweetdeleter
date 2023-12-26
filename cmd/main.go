@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -35,11 +36,25 @@ func main() {
 		logger.Fatal("end-date flag is required")
 	}
 
+	parsedStart, err := time.Parse(time.DateOnly, *startDate)
+	if err != nil {
+		logger.Fatal("could not parse start date", zap.Error(err))
+	}
+	parsedEnd, err := time.Parse(time.DateOnly, *endDate)
+	if err != nil {
+		logger.Fatal("could not parse end date", zap.Error(err))
+	}
+
+	if !parsedEnd.After(parsedStart) {
+		logger.Fatal("invalid start and end time. start time must be before end time",
+			zap.Time("startDate", parsedStart), zap.Time("endDate", parsedEnd))
+	}
+
 	td, err := internal.NewTweetDeleter(internal.TweetDeleterOptions{
 		Username:  *username,
 		Password:  *password,
-		StartDate: *startDate,
-		EndDate:   *endDate,
+		StartDate: parsedStart,
+		EndDate:   parsedEnd,
 		Logger:    logger,
 	})
 	if err != nil {

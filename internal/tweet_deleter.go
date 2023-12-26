@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/kb"
 	"go.uber.org/zap"
@@ -16,16 +17,16 @@ import (
 type TweetDeleter struct {
 	username  string
 	password  string
-	startDate string
-	endDate   string
+	startDate time.Time
+	endDate   time.Time
 	logger    *zap.Logger
 }
 
 type TweetDeleterOptions struct {
 	Username  string
 	Password  string
-	StartDate string
-	EndDate   string
+	StartDate time.Time
+	EndDate   time.Time
 	Logger    *zap.Logger
 }
 
@@ -59,33 +60,72 @@ func (t *TweetDeleter) Run() error {
 	}
 	t.logger.Info("successfully logged in", zap.String("username", t.username))
 
-	// Search provided date range
-	if err := chromedp.Run(ctx, t.searchTweets()); err != nil {
-		return fmt.Errorf("error while attempting to search for tweets: %w", err)
-	}
-	t.logger.Info("searched for latest tweets",
-		zap.String("startDate", t.startDate), zap.String("endDate", t.endDate))
-
-	// Loop through tweets and delete them
-	t.logger.Info("commencing deleting tweets...")
-	for i := 1; ; i++ {
-		var tweets []*cdp.Node
-		if err := chromedp.Run(ctx, chromedp.Nodes("article[data-testid=\"tweet\"]", &tweets)); err != nil {
-			return fmt.Errorf("failed to retrieve tweets for deleting: %w", err)
+	// Search and delete tweets in 7 day chunks. Larger chunks, like a year, tend to not return
+	// all available tweets
+	for since, until := t.startDate, t.startDate; until.Before(t.endDate); since = until {
+		until = since.Add(7 * 86400 * time.Second) // 7 days
+		if until.After(t.endDate) {
+			until = t.endDate
 		}
 
-		if err := chromedp.Run(ctx, t.deleteTweet()); err != nil {
-			return err
+		// Search provided date range
+		if err := chromedp.Run(ctx, t.searchTweets(since, until)); err != nil {
+			return fmt.Errorf("error while attempting to search for tweets: %w", err)
+		}
+		t.logger.Info("searched for latest tweets",
+			zap.Time("startDate", since), zap.Time("endDate", until))
+
+		// Check to see if search yielding any results
+		var emptyState bool
+		err := chromedp.Run(ctx,
+			// Give the search results some time to load.
+			// TODO: Have a more reliable check here that's not just waiting
+			chromedp.Sleep(3*time.Second),
+			// This is very hacky. There's not a clean way to just check if an element exists so
+			// we query for a selector, indicate that we're ok with 0 elements being returned so we don't wait
+			// indefinitely, and then we add a custom wait QueryOption to see how many elements were found.
+			// Either way, we return a non-nil slice of nodes so that the check doesn't repeat indefinitely.
+			chromedp.Query(
+				"div[data-testid=\"emptyState\"]",
+				chromedp.AtLeast(0),
+				chromedp.WaitFunc(func(ctx context.Context, frame *cdp.Frame, id runtime.ExecutionContextID, nid ...cdp.NodeID) ([]*cdp.Node, error) {
+					if len(nid) > 0 {
+						emptyState = true
+					}
+					return []*cdp.Node{}, nil
+				}),
+			))
+		if err != nil {
+			return fmt.Errorf("error checking if search returned tweets: %w", err)
 		}
 
-		if i%10 == 0 {
-			t.logger.Info(fmt.Sprintf("%d tweets deleted", i))
+		if emptyState {
+			t.logger.Info("no tweets found for time range. skipping to next",
+				zap.Time("startDate", since), zap.Time("endDate", until))
+			continue
 		}
 
-		// We've deleted our last tweet so let's bail
-		if len(tweets) == 1 {
-			t.logger.Info("no more tweets to delete from provided time range", zap.Int("tweetsDeleted", i))
-			break
+		// Loop through tweets and delete them
+		t.logger.Info("commencing deleting tweets...")
+		for i := 1; ; i++ {
+			var tweets []*cdp.Node
+			if err := chromedp.Run(ctx, chromedp.Nodes("article[data-testid=\"tweet\"]", &tweets)); err != nil {
+				return fmt.Errorf("failed to retrieve tweets for deleting: %w", err)
+			}
+
+			if err := chromedp.Run(ctx, t.deleteTweet()); err != nil {
+				return err
+			}
+
+			if i%10 == 0 {
+				t.logger.Info(fmt.Sprintf("%d tweets deleted", i))
+			}
+
+			// We've deleted our last tweet so let's bail
+			if len(tweets) == 1 {
+				t.logger.Info("no more tweets to delete from provided time range", zap.Int("tweetsDeleted", i))
+				break
+			}
 		}
 	}
 
@@ -95,29 +135,26 @@ func (t *TweetDeleter) Run() error {
 func (t *TweetDeleter) login() chromedp.Tasks {
 	return chromedp.Tasks{
 		chromedp.Navigate("https://twitter.com/i/flow/login"),
-		chromedp.WaitVisible("input[name=\"text\"]"),
-		chromedp.Click("input[name=\"text\"]"),
+		chromedp.Click("input[name=\"text\"]", chromedp.NodeVisible),
 		chromedp.SendKeys("input[name=\"text\"]", t.username),
 		chromedp.Sleep(1 * time.Second), // NB: this may be unnecessary
 		chromedp.Click("div[role=\"button\"]:nth-of-type(6)"),
-		chromedp.WaitVisible("input[name=\"password\"]"),
-		chromedp.Click("input[name=\"password\"]"),
+		chromedp.Click("input[name=\"password\"]", chromedp.NodeVisible),
 		chromedp.SendKeys("input[name=\"password\"]", t.password),
 		chromedp.Click("div[data-testid=\"LoginForm_Login_Button\"]"),
 		chromedp.WaitVisible("a[href=\"/explore\"]"),
 	}
 }
 
-func (t *TweetDeleter) searchTweets() chromedp.Tasks {
+func (t *TweetDeleter) searchTweets(since, until time.Time) chromedp.Tasks {
 	return chromedp.Tasks{
 		chromedp.Navigate("https://twitter.com/explore"),
 		chromedp.Click("input[data-testid=\"SearchBox_Search_Input\"]"),
 		chromedp.SendKeys("input[data-testid=\"SearchBox_Search_Input\"]",
-			fmt.Sprintf("from:%s since:%s until:%s"+kb.Enter, t.username, t.startDate, t.endDate)),
-		// TODO: check that this search time range actually has tweets. Right now, will just hang if not.
-		chromedp.WaitVisible("article[data-testid=\"tweet\"]"),
-		chromedp.Click("a[href*=\"live\"][role=\"tab\"]"), // Click the "Latest" tab
-		chromedp.WaitVisible("article[data-testid=\"tweet\"]"),
+			fmt.Sprintf(
+				"from:%s since:%s until:%s"+kb.Enter, t.username, since.Format(time.DateOnly), until.Format(time.DateOnly),
+			)),
+		chromedp.Click("a[href*=\"live\"][role=\"tab\"]", chromedp.NodeVisible), // Click the "Latest" tab
 	}
 }
 
